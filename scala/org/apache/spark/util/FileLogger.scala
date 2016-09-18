@@ -61,14 +61,6 @@ private[spark] class FileLogger(
   // Only defined if the file system scheme is not local
   private var hadoopDataStream: Option[FSDataOutputStream] = None
 
-  // The Hadoop APIs have changed over time, so we use reflection to figure out
-  // the correct method to use to flush a hadoop data stream. See SPARK-1518
-  // for details.
-  private val hadoopFlushMethod = {
-    val cls = classOf[FSDataOutputStream]
-    scala.util.Try(cls.getMethod("hflush")).getOrElse(cls.getMethod("sync"))
-  }
-
   private var writer: Option[PrintWriter] = None
 
   /**
@@ -157,13 +149,13 @@ private[spark] class FileLogger(
   /**
    * Flush the writer to disk manually.
    *
-   * When using a Hadoop filesystem, we need to invoke the hflush or sync
-   * method. In HDFS, hflush guarantees that the data gets to all the
-   * DataNodes.
+   * If the Hadoop FileSystem is used, the underlying FSDataOutputStream (r1.0.4) must be
+   * sync()'ed manually as it does not support flush(), which is invoked by when higher
+   * level streams are flushed.
    */
   def flush() {
     writer.foreach(_.flush())
-    hadoopDataStream.foreach(hadoopFlushMethod.invoke(_))
+    hadoopDataStream.foreach(_.sync())
   }
 
   /**

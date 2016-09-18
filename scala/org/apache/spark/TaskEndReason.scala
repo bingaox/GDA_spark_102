@@ -30,69 +30,27 @@ import org.apache.spark.storage.BlockManagerId
 @DeveloperApi
 sealed trait TaskEndReason
 
-/**
- * :: DeveloperApi ::
- * Task succeeded.
- */
 @DeveloperApi
 case object Success extends TaskEndReason
 
-/**
- * :: DeveloperApi ::
- * Various possible reasons why a task failed.
- */
 @DeveloperApi
-sealed trait TaskFailedReason extends TaskEndReason {
-  /** Error message displayed in the web UI. */
-  def toErrorString: String
-}
+case object Resubmitted extends TaskEndReason // Task was finished earlier but we've now lost it
 
-/**
- * :: DeveloperApi ::
- * A [[org.apache.spark.scheduler.ShuffleMapTask]] that completed successfully earlier, but we
- * lost the executor before the stage completed. This means Spark needs to reschedule the task
- * to be re-executed on a different executor.
- */
-@DeveloperApi
-case object Resubmitted extends TaskFailedReason {
-  override def toErrorString: String = "Resubmitted (resubmitted due to lost executor)"
-}
-
-/**
- * :: DeveloperApi ::
- * Task failed to fetch shuffle data from a remote node. Probably means we have lost the remote
- * executors the task is trying to fetch from, and thus need to rerun the previous stage.
- */
 @DeveloperApi
 case class FetchFailed(
     bmAddress: BlockManagerId,
     shuffleId: Int,
     mapId: Int,
     reduceId: Int)
-  extends TaskFailedReason {
-  override def toErrorString: String = {
-    val bmAddressString = if (bmAddress == null) "null" else bmAddress.toString
-    s"FetchFailed($bmAddressString, shuffleId=$shuffleId, mapId=$mapId, reduceId=$reduceId)"
-  }
-}
+  extends TaskEndReason
 
-/**
- * :: DeveloperApi ::
- * Task failed due to a runtime exception. This is the most common failure case and also captures
- * user program exceptions.
- */
 @DeveloperApi
 case class ExceptionFailure(
     className: String,
     description: String,
     stackTrace: Array[StackTraceElement],
     metrics: Option[TaskMetrics])
-  extends TaskFailedReason {
-  override def toErrorString: String = {
-    val stackTraceString = if (stackTrace == null) "null" else stackTrace.mkString("\n")
-    s"$className ($description}\n$stackTraceString"
-  }
-}
+  extends TaskEndReason
 
 /**
  * :: DeveloperApi ::
@@ -100,18 +58,10 @@ case class ExceptionFailure(
  * it was fetched.
  */
 @DeveloperApi
-case object TaskResultLost extends TaskFailedReason {
-  override def toErrorString: String = "TaskResultLost (result lost from block manager)"
-}
+case object TaskResultLost extends TaskEndReason
 
-/**
- * :: DeveloperApi ::
- * Task was killed intentionally and needs to be rescheduled.
- */
 @DeveloperApi
-case object TaskKilled extends TaskFailedReason {
-  override def toErrorString: String = "TaskKilled (killed intentionally)"
-}
+case object TaskKilled extends TaskEndReason
 
 /**
  * :: DeveloperApi ::
@@ -119,9 +69,7 @@ case object TaskKilled extends TaskFailedReason {
  * the task crashed the JVM.
  */
 @DeveloperApi
-case object ExecutorLostFailure extends TaskFailedReason {
-  override def toErrorString: String = "ExecutorLostFailure (executor lost)"
-}
+case object ExecutorLostFailure extends TaskEndReason
 
 /**
  * :: DeveloperApi ::
@@ -129,6 +77,4 @@ case object ExecutorLostFailure extends TaskFailedReason {
  * deserializing the task result.
  */
 @DeveloperApi
-case object UnknownReason extends TaskFailedReason {
-  override def toErrorString: String = "UnknownReason"
-}
+case object UnknownReason extends TaskEndReason

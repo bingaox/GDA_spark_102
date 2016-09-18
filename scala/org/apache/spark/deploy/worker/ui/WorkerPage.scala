@@ -46,62 +46,74 @@ private[spark] class WorkerPage(parent: WorkerWebUI) extends WebUIPage("") {
     val stateFuture = (workerActor ? RequestWorkerState)(timeout).mapTo[WorkerStateResponse]
     val workerState = Await.result(stateFuture, timeout)
 
-    val executorHeaders = Seq("ExecutorID", "Cores", "State", "Memory", "Job Details", "Logs")
-    val runningExecutors = workerState.executors
+    val executorHeaders = Seq("ExecutorID", "Cores", "Memory", "Job Details", "Logs")
     val runningExecutorTable =
-      UIUtils.listingTable(executorHeaders, executorRow, runningExecutors)
-    val finishedExecutors = workerState.finishedExecutors
+      UIUtils.listingTable(executorHeaders, executorRow, workerState.executors)
     val finishedExecutorTable =
-      UIUtils.listingTable(executorHeaders, executorRow, finishedExecutors)
+      UIUtils.listingTable(executorHeaders, executorRow, workerState.finishedExecutors)
 
     val driverHeaders = Seq("DriverID", "Main Class", "State", "Cores", "Memory", "Logs", "Notes")
     val runningDrivers = workerState.drivers.sortBy(_.driverId).reverse
     val runningDriverTable = UIUtils.listingTable(driverHeaders, driverRow, runningDrivers)
     val finishedDrivers = workerState.finishedDrivers.sortBy(_.driverId).reverse
-    val finishedDriverTable = UIUtils.listingTable(driverHeaders, driverRow, finishedDrivers)
+    def finishedDriverTable = UIUtils.listingTable(driverHeaders, driverRow, finishedDrivers)
 
     // For now we only show driver information if the user has submitted drivers to the cluster.
     // This is until we integrate the notion of drivers and applications in the UI.
+    def hasDrivers = runningDrivers.length > 0 || finishedDrivers.length > 0
 
     val content =
-      <div class="row-fluid"> <!-- Worker Details -->
-        <div class="span12">
-          <ul class="unstyled">
-            <li><strong>ID:</strong> {workerState.workerId}</li>
-            <li><strong>
-              Master URL:</strong> {workerState.masterUrl}
-            </li>
-            <li><strong>Cores:</strong> {workerState.cores} ({workerState.coresUsed} Used)</li>
-            <li><strong>Memory:</strong> {Utils.megabytesToString(workerState.memory)}
-              ({Utils.megabytesToString(workerState.memoryUsed)} Used)</li>
-          </ul>
-          <p><a href={workerState.masterWebUiUrl}>Back to Master</a></p>
+        <div class="row-fluid"> <!-- Worker Details -->
+          <div class="span12">
+            <ul class="unstyled">
+              <li><strong>ID:</strong> {workerState.workerId}</li>
+              <li><strong>
+                Master URL:</strong> {workerState.masterUrl}
+              </li>
+              <li><strong>Cores:</strong> {workerState.cores} ({workerState.coresUsed} Used)</li>
+              <li><strong>Memory:</strong> {Utils.megabytesToString(workerState.memory)}
+                ({Utils.megabytesToString(workerState.memoryUsed)} Used)</li>
+            </ul>
+            <p><a href={workerState.masterWebUiUrl}>Back to Master</a></p>
+          </div>
         </div>
-      </div>
-      <div class="row-fluid"> <!-- Executors and Drivers -->
-        <div class="span12">
-          <h4> Running Executors ({runningExecutors.size}) </h4>
-          {runningExecutorTable}
-          {
-            if (runningDrivers.nonEmpty) {
-              <h4> Running Drivers ({runningDrivers.size}) </h4> ++
-              runningDriverTable
-            }
-          }
-          {
-            if (finishedExecutors.nonEmpty) {
-              <h4>Finished Executors ({finishedExecutors.size}) </h4> ++
-              finishedExecutorTable
-            }
-          }
-          {
-            if (finishedDrivers.nonEmpty) {
-              <h4> Finished Drivers ({finishedDrivers.size}) </h4> ++
-              finishedDriverTable
-            }
+
+        <div class="row-fluid"> <!-- Running Executors -->
+          <div class="span12">
+            <h4> Running Executors {workerState.executors.size} </h4>
+            {runningExecutorTable}
+          </div>
+        </div>
+        // scalastyle:off
+        <div>
+          {if (hasDrivers)
+            <div class="row-fluid"> <!-- Running Drivers -->
+              <div class="span12">
+                <h4> Running Drivers {workerState.drivers.size} </h4>
+                {runningDriverTable}
+              </div>
+            </div>
           }
         </div>
-      </div>;
+
+        <div class="row-fluid"> <!-- Finished Executors  -->
+          <div class="span12">
+            <h4> Finished Executors </h4>
+            {finishedExecutorTable}
+          </div>
+        </div>
+
+        <div>
+          {if (hasDrivers)
+            <div class="row-fluid"> <!-- Finished Drivers  -->
+              <div class="span12">
+                <h4> Finished Drivers </h4>
+                {finishedDriverTable}
+              </div>
+            </div>
+          }
+        </div>;
+    // scalastyle:on
     UIUtils.basicSparkPage(content, "Spark Worker at %s:%s".format(
       workerState.host, workerState.port))
   }
@@ -110,7 +122,6 @@ private[spark] class WorkerPage(parent: WorkerWebUI) extends WebUIPage("") {
     <tr>
       <td>{executor.execId}</td>
       <td>{executor.cores}</td>
-      <td>{executor.state}</td>
       <td sorttable_customkey={executor.memory.toString}>
         {Utils.megabytesToString(executor.memory)}
       </td>

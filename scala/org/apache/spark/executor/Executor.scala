@@ -97,6 +97,10 @@ private[spark] class Executor(
   private val urlClassLoader = createClassLoader()
   private val replClassLoader = addReplClassLoaderIfNeeded(urlClassLoader)
 
+  // Akka's message frame size. If task result is bigger than this, we use the block manager
+  // to send the result back.
+  private val akkaFrameSize = AkkaUtils.maxFrameSizeBytes(conf)
+
   // Start worker thread pool
   val threadPool = Utils.newDaemonCachedThreadPool("Executor task launch worker")
 
@@ -109,10 +113,23 @@ private[spark] class Executor(
     threadPool.execute(tr)
   }
 
+  def updateMapOutput(mapStatus: Array[Byte], shuffleId: Int, reduceId: Int) {
+    if (shuffleId != -1 && mapStatus != null) {
+      env.mapOutputTracker.updateMapStatusesFromTask(mapStatus, shuffleId)
+    }
+    env.shuffleFetcher.updateFetch(shuffleId, reduceId)
+  }
+
   def killTask(taskId: Long, interruptThread: Boolean) {
     val tr = runningTasks.get(taskId)
     if (tr != null) {
       tr.kill(interruptThread)
+    }
+  }
+
+  def updateMOLFromTaskDesc(mapStatus: Array[Byte], shuffleId: Int) {
+    if (shuffleId != -1 && mapStatus != null) {
+      env.mapOutputTracker.updateMapStatusesFromTask(mapStatus, shuffleId)
     }
   }
 
@@ -176,10 +193,30 @@ private[spark] class Executor(
 
         attemptedTask = Some(task)
         logDebug("Task " + taskId + "'s epoch is " + task.epoch)
+        logInfo("Task shuffle ID " + task.shuffleId)
         env.mapOutputTracker.updateEpoch(task.epoch)
+
+        // use the outputtracker information from the task
+        if (task.shuffleId != null && task.shuffleId != -1
+          && task.serializedMapStatuses != null && task.serializedMapStatuses.length != 0) {
+          env.mapOutputTracker.updateMapStatusesFromTask(task.serializedMapStatuses, task.shuffleId)
+        }
+
+        logInfo("Reading from task: blockId " + task.blockId + " manager Id " + task.blockManagerId)
+        if (task.blockId != null && task.blockId != -1
+          && task.blockManagerId != null && task.blockManagerId.length != 0) {
+          env.blockManager.saveBlockLoc(task.blockId, task.blockManagerId)
+        }
+
+        //test faulty recovery for eager scheduling
+        //if (taskId == 5) Thread.sleep(4000)
+        //if (taskId == 2 || taskId == 5) {
+        //  throw new TaskKilledException
+        //}
 
         // Run the actual task and measure its runtime.
         taskStart = System.currentTimeMillis()
+        //Thread.sleep(10000)
         val value = task.run(taskId.toInt)
         val taskFinish = System.currentTimeMillis()
 
@@ -207,10 +244,8 @@ private[spark] class Executor(
           task.metrics.getOrElse(null))
         val serializedDirectResult = ser.serialize(directResult)
         logInfo("Serialized size of result for " + taskId + " is " + serializedDirectResult.limit)
-
         val serializedResult = {
-          if (serializedDirectResult.limit >= execBackend.akkaFrameSize() -
-              AkkaUtils.reservedSizeBytes) {
+          if (serializedDirectResult.limit >= akkaFrameSize - 1024) {
             logInfo("Storing result for " + taskId + " in local BlockManager")
             val blockId = TaskResultBlockId(taskId)
             env.blockManager.putBytes(

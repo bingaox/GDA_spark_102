@@ -27,10 +27,10 @@ import akka.actor._
 import akka.pattern.ask
 import akka.remote.{DisassociatedEvent, RemotingLifecycleEvent}
 
-import org.apache.spark.{SparkEnv, Logging, SparkException, TaskState}
-import org.apache.spark.scheduler.{SchedulerBackend, SlaveLost, TaskDescription, TaskSchedulerImpl, WorkerOffer}
+import org.apache.spark.{Logging, SparkException, TaskState}
+import org.apache.spark.scheduler.{SchedulerBackend, SlaveLost, TaskDescription, TaskSchedulerImpl, WorkerOffer, WorkerOfferWithBW}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
-import org.apache.spark.util.{SerializableBuffer, AkkaUtils, Utils}
+import org.apache.spark.util.{AkkaUtils, Utils}
 
 /**
  * A scheduler backend that waits for coarse grained executors to connect to it through Akka.
@@ -48,7 +48,6 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
   var totalCoreCount = new AtomicInteger(0)
   val conf = scheduler.sc.conf
   private val timeout = AkkaUtils.askTimeout(conf)
-  private val akkaFrameSize = AkkaUtils.maxFrameSizeBytes(conf)
 
   class DriverActor(sparkProperties: Seq[(String, String)]) extends Actor {
     private val executorActor = new HashMap[String, ActorRef]
@@ -56,6 +55,8 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
     private val executorHost = new HashMap[String, String]
     private val freeCores = new HashMap[String, Int]
     private val totalCores = new HashMap[String, Int]
+    private val freeBWs = new HashMap[String, Double]
+    private val totalBWs = new HashMap[String, Double]
     private val addressToExecutorId = new HashMap[Address, String]
 
     override def preStart() {
@@ -69,7 +70,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
     }
 
     def receive = {
-      case RegisterExecutor(executorId, hostPort, cores) =>
+      case RegisterExecutor(executorId, hostPort, cores, bw) =>
         Utils.checkHostPort(hostPort, "Host port expected " + hostPort)
         if (executorActor.contains(executorId)) {
           sender ! RegisterExecutorFailed("Duplicate executor ID: " + executorId)
@@ -80,6 +81,15 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
           executorHost(executorId) = Utils.parseHostPort(hostPort)._1
           totalCores(executorId) = cores
           freeCores(executorId) = cores
+          // update bandwidth info, as it might vary over time
+          val host = Utils.parseHostPort(hostPort)._1
+          if (!totalBWs.contains(host)) {
+            totalBWs(host) = bw
+            freeBWs(host) = bw
+          } else {
+            freeBWs(host) = freeBWs(host) + bw - totalBWs(host)
+            totalBWs(host) = bw
+          }
           executorAddress(executorId) = sender.path.address
           addressToExecutorId(sender.path.address) = executorId
           totalCoreCount.addAndGet(cores)
@@ -100,7 +110,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
         }
 
       case ReviveOffers =>
-        makeOffers()
+        makeOffersWithBW()
 
       case KillTask(taskId, executorId, interruptThread) =>
         executorActor(executorId) ! KillTask(taskId, executorId, interruptThread)
@@ -124,6 +134,13 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
         addressToExecutorId.get(address).foreach(removeExecutor(_,
           "remote Akka client disassociated"))
 
+      case UpdateMapOutput(eId, shuffleId, statuses, index) =>
+        updateMapOutput(eId, shuffleId, statuses, index)
+    }
+
+    def makeOffersWithBW() {
+      launchTasks(scheduler.resourceOffersWithBW(
+        executorHost.toArray.map {case (id, host) => new WorkerOfferWithBW(id, host, freeCores(id), freeBWs(host))}))
     }
 
     // Make fake resource offers on all executors
@@ -134,6 +151,7 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
 
     // Make fake resource offers on just one executor
     def makeOffers(executorId: String) {
+      logInfo("ERROR: assuming this function is not called, makeOffers(oneExec)")
       launchTasks(scheduler.resourceOffers(
         Seq(new WorkerOffer(executorId, executorHost(executorId), freeCores(executorId)))))
     }
@@ -141,27 +159,18 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
     // Launch tasks returned by a set of resource offers
     def launchTasks(tasks: Seq[Seq[TaskDescription]]) {
       for (task <- tasks.flatten) {
-        val ser = SparkEnv.get.closureSerializer.newInstance()
-        val serializedTask = ser.serialize(task)
-        if (serializedTask.limit >= akkaFrameSize - AkkaUtils.reservedSizeBytes) {
-          val taskSetId = scheduler.taskIdToTaskSetId(task.taskId)
-          scheduler.activeTaskSets.get(taskSetId).foreach { taskSet =>
-            try {
-              var msg = "Serialized task %s:%d was %d bytes which " +
-                "exceeds spark.akka.frameSize (%d bytes). " +
-                "Consider using broadcast variables for large values."
-              msg = msg.format(task.taskId, task.index, serializedTask.limit, akkaFrameSize)
-              taskSet.abort(msg)
-            } catch {
-              case e: Exception => logError("Exception in error callback", e)
-            }
-          }
-        }
-        else {
-          freeCores(task.executorId) -= scheduler.CPUS_PER_TASK
-          executorActor(task.executorId) ! LaunchTask(new SerializableBuffer(serializedTask))
-        }
+        freeCores(task.executorId) -= scheduler.CPUS_PER_TASK
+        freeBWs(executorHost(task.executorId)) -= task.bw
+        logInfo("launch task from master " + "id:" + task.taskId + " executor id: " + task.executorId)
+        executorActor(task.executorId) ! LaunchTask(task)
       }
+    }
+
+    def updateMapOutput(eId: String,
+                        shuffleId: Int,
+                        statuses: Array[Byte],
+                        index: Int) {
+      executorActor(eId) ! UpdateMapOutputExecutor(statuses, shuffleId, index)
     }
 
     // Remove a disconnected slave from the cluster
@@ -170,11 +179,16 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
         logInfo("Executor " + executorId + " disconnected, so removing it")
         val numCores = totalCores(executorId)
         executorActor -= executorId
+        val host = executorHost(executorId)
         executorHost -= executorId
         addressToExecutorId -= executorAddress(executorId)
         executorAddress -= executorId
         totalCores -= executorId
         freeCores -= executorId
+        if (!executorHost.values.exists(_ == host)) {
+          totalBWs -= host
+          freeBWs -= host
+        }
         totalCoreCount.addAndGet(-numCores)
         scheduler.executorLost(executorId, SlaveLost(reason))
       }
@@ -224,6 +238,13 @@ class CoarseGrainedSchedulerBackend(scheduler: TaskSchedulerImpl, actorSystem: A
 
   override def reviveOffers() {
     driverActor ! ReviveOffers
+  }
+
+  override def updateMapOutput(eId: String,
+                      shuffleId: Int,
+                      statuses: Array[Byte],
+                      index: Int) {
+    driverActor ! UpdateMapOutput(eId, shuffleId, statuses, index)
   }
 
   override def killTask(taskId: Long, executorId: String, interruptThread: Boolean) {

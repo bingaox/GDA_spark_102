@@ -20,7 +20,6 @@ package org.apache.spark.util.collection
 import java.io.{InputStream, BufferedInputStream, FileInputStream, File, Serializable, EOFException}
 import java.util.Comparator
 
-import scala.collection.BufferedIterator
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
@@ -232,7 +231,7 @@ class ExternalAppendOnlyMap[K, V, C](
     // Input streams are derived both from the in-memory map and spilled maps on disk
     // The in-memory map is sorted in place, while the spilled maps are already in sorted order
     private val sortedMap = currentMap.destructiveSortedIterator(comparator)
-    private val inputStreams = (Seq(sortedMap) ++ spilledMaps).map(it => it.buffered)
+    private val inputStreams = Seq(sortedMap) ++ spilledMaps
 
     inputStreams.foreach { it =>
       val kcPairs = getMorePairs(it)
@@ -247,13 +246,13 @@ class ExternalAppendOnlyMap[K, V, C](
      * In the event of key hash collisions, this ensures no pairs are hidden from being merged.
      * Assume the given iterator is in sorted order.
      */
-    private def getMorePairs(it: BufferedIterator[(K, C)]): ArrayBuffer[(K, C)] = {
+    private def getMorePairs(it: Iterator[(K, C)]): ArrayBuffer[(K, C)] = {
       val kcPairs = new ArrayBuffer[(K, C)]
       if (it.hasNext) {
         var kc = it.next()
         kcPairs += kc
-        val minHash = getKeyHashCode(kc)
-        while (it.hasNext && it.head._1.hashCode() == minHash) {
+        val minHash = kc._1.hashCode()
+        while (it.hasNext && kc._1.hashCode() == minHash) {
           kc = it.next()
           kcPairs += kc
         }
@@ -294,9 +293,8 @@ class ExternalAppendOnlyMap[K, V, C](
       // Select a key from the StreamBuffer that holds the lowest key hash
       val minBuffer = mergeHeap.dequeue()
       val (minPairs, minHash) = (minBuffer.pairs, minBuffer.minKeyHash)
-      val minPair = minPairs.remove(0)
-      var (minKey, minCombiner) = minPair
-      assert(getKeyHashCode(minPair) == minHash)
+      var (minKey, minCombiner) = minPairs.remove(0)
+      assert(minKey.hashCode() == minHash)
 
       // For all other streams that may have this key (i.e. have the same minimum key hash),
       // merge in the corresponding value (if any) from that stream
@@ -327,17 +325,15 @@ class ExternalAppendOnlyMap[K, V, C](
      *
      * StreamBuffers are ordered by the minimum key hash found across all of their own pairs.
      */
-    private class StreamBuffer(
-        val iterator: BufferedIterator[(K, C)],
-        val pairs: ArrayBuffer[(K, C)])
+    private case class StreamBuffer(iterator: Iterator[(K, C)], pairs: ArrayBuffer[(K, C)])
       extends Comparable[StreamBuffer] {
 
       def isEmpty = pairs.length == 0
 
       // Invalid if there are no more pairs in this stream
-      def minKeyHash: Int = {
+      def minKeyHash = {
         assert(pairs.length > 0)
-        getKeyHashCode(pairs.head)
+        pairs.head._1.hashCode()
       }
 
       override def compareTo(other: StreamBuffer): Int = {
@@ -424,22 +420,10 @@ class ExternalAppendOnlyMap[K, V, C](
 }
 
 private[spark] object ExternalAppendOnlyMap {
-
-  /**
-   * Return the key hash code of the given (key, combiner) pair.
-   * If the key is null, return a special hash code.
-   */
-  private def getKeyHashCode[K, C](kc: (K, C)): Int = {
-    if (kc._1 == null) 0 else kc._1.hashCode()
-  }
-
-  /**
-   * A comparator for (key, combiner) pairs based on their key hash codes.
-   */
   private class KCComparator[K, C] extends Comparator[(K, C)] {
     def compare(kc1: (K, C), kc2: (K, C)): Int = {
-      val hash1 = getKeyHashCode(kc1)
-      val hash2 = getKeyHashCode(kc2)
+      val hash1 = kc1._1.hashCode()
+      val hash2 = kc2._1.hashCode()
       if (hash1 < hash2) -1 else if (hash1 == hash2) 0 else 1
     }
   }

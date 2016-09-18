@@ -61,25 +61,18 @@ private[spark] class ExecutorRunner(
     // Shutdown hook that kills actors on shutdown.
     shutdownHook = new Thread() {
       override def run() {
-        killProcess(Some("Worker shutting down"))
+        killProcess()
       }
     }
     Runtime.getRuntime.addShutdownHook(shutdownHook)
   }
 
-  /**
-   * kill executor process, wait for exit and notify worker to update resource status
-   *
-   * @param message the exception message which caused the executor's death 
-   */
-  private def killProcess(message: Option[String]) {
-    var exitCode: Option[Int] = None
+  private def killProcess() {
     if (process != null) {
       logInfo("Killing process!")
       process.destroy()
-      val exitCode = Some(process.waitFor())
+      process.waitFor()
     }
-    worker ! ExecutorStateChanged(appId, execId, state, message, exitCode)
   }
 
   /** Stop this executor runner, including killing the process it launched */
@@ -89,6 +82,7 @@ private[spark] class ExecutorRunner(
       workerThread.interrupt()
       workerThread = null
       state = ExecutorState.KILLED
+      worker ! ExecutorStateChanged(appId, execId, state, None, None)
       Runtime.getRuntime.removeShutdownHook(shutdownHook)
     }
   }
@@ -144,22 +138,24 @@ private[spark] class ExecutorRunner(
       Files.write(header, stderr, Charsets.UTF_8)
       CommandUtils.redirectStream(process.getErrorStream, stderr)
 
-      // Wait for it to exit; executor may exit with code 0 (when driver instructs it to shutdown)
-      // or with nonzero exit code
+      // Wait for it to exit; this is actually a bad thing if it happens, because we expect to run
+      // long-lived processes only. However, in the future, we might restart the executor a few
+      // times on the same machine.
       val exitCode = process.waitFor()
-      state = ExecutorState.EXITED
+      state = ExecutorState.FAILED
       val message = "Command exited with code " + exitCode
       worker ! ExecutorStateChanged(appId, execId, state, Some(message), Some(exitCode))
     } catch {
       case interrupted: InterruptedException => {
         logInfo("Runner thread for executor " + fullId + " interrupted")
-        state = ExecutorState.KILLED
-        killProcess(None)
+        killProcess()
       }
       case e: Exception => {
         logError("Error running executor", e)
+        killProcess()
         state = ExecutorState.FAILED
-        killProcess(Some(e.toString))
+        val message = e.getClass + ": " + e.getMessage
+        worker ! ExecutorStateChanged(appId, execId, state, Some(message), None)
       }
     }
   }

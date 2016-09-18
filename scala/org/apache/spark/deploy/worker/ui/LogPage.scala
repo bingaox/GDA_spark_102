@@ -124,7 +124,7 @@ private[spark] class LogPage(parent: WorkerWebUI) extends WebUIPage("logPage") {
           </div>
         </body>
       </html>
-    UIUtils.basicSparkPage(content, logType + " log page for " + appId.getOrElse("unknown app"))
+    UIUtils.basicSparkPage(content, logType + " log page for " + appId)
   }
 
   /** Determine the byte range for a log or log page. */

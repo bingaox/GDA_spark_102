@@ -22,20 +22,19 @@ import java.nio.ByteBuffer
 import akka.actor._
 import akka.remote._
 
-import org.apache.spark.{SparkEnv, Logging, SecurityManager, SparkConf}
+import org.apache.spark.{Logging, SecurityManager, SparkConf}
 import org.apache.spark.TaskState.TaskState
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.deploy.worker.WorkerWatcher
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
-import org.apache.spark.scheduler.TaskDescription
 import org.apache.spark.util.{AkkaUtils, Utils}
+
 
 private[spark] class CoarseGrainedExecutorBackend(
     driverUrl: String,
     executorId: String,
     hostPort: String,
-    cores: Int,
-    actorSystem: ActorSystem)
+    cores: Int)
   extends Actor
   with ExecutorBackend
   with Logging {
@@ -45,10 +44,14 @@ private[spark] class CoarseGrainedExecutorBackend(
   var executor: Executor = null
   var driver: ActorSelection = null
 
+  def readBWFromFile(filename: String): Double = {
+    scala.io.Source.fromFile(filename).mkString.toDouble
+  }
+
   override def preStart() {
     logInfo("Connecting to driver: " + driverUrl)
     driver = context.actorSelection(driverUrl)
-    driver ! RegisterExecutor(executorId, hostPort, cores)
+    driver ! RegisterExecutor(executorId, hostPort, cores, readBWFromFile("/root/bw.txt"))
     context.system.eventStream.subscribe(self, classOf[RemotingLifecycleEvent])
   }
 
@@ -63,16 +66,23 @@ private[spark] class CoarseGrainedExecutorBackend(
       logError("Slave registration failed: " + message)
       System.exit(1)
 
-    case LaunchTask(data) =>
+    case LaunchTask(taskDesc) =>
+      logInfo(" name " + taskDesc.name + " additioanl: " + taskDesc.additional)
+      //+ taskDesc.name + " id" + taskDesc.additional)
+      logInfo("Got assigned task " + taskDesc.taskId)
+
+      //executor.updateMOLFromTaskDesc(taskDesc.mapStatus, taskDesc.additional)
+
+      //logInfo("additional bit" + taskDesc.additional)
       if (executor == null) {
         logError("Received LaunchTask command but executor was null")
         System.exit(1)
       } else {
-        val ser = SparkEnv.get.closureSerializer.newInstance()
-        val taskDesc = ser.deserialize[TaskDescription](data.value)
-        logInfo("Got assigned task " + taskDesc.taskId)
         executor.launchTask(this, taskDesc.taskId, taskDesc.serializedTask)
       }
+
+    case UpdateMapOutputExecutor(serializedStatus: Array[Byte], shuffleId: Int, reduceId: Int) =>
+      executor.updateMapOutput(serializedStatus, shuffleId, reduceId)
 
     case KillTask(taskId, _, interruptThread) =>
       if (executor == null) {
@@ -95,9 +105,6 @@ private[spark] class CoarseGrainedExecutorBackend(
   override def statusUpdate(taskId: Long, state: TaskState, data: ByteBuffer) {
     driver ! StatusUpdate(executorId, taskId, state, data)
   }
-
-  override def akkaFrameSize() = actorSystem.settings.config.getBytes(
-    "akka.remote.netty.tcp.maximum-frame-size")
 }
 
 private[spark] object CoarseGrainedExecutorBackend {
@@ -117,7 +124,7 @@ private[spark] object CoarseGrainedExecutorBackend {
         val sparkHostPort = hostname + ":" + boundPort
         actorSystem.actorOf(
           Props(classOf[CoarseGrainedExecutorBackend], driverUrl, executorId,
-            sparkHostPort, cores, actorSystem),
+            sparkHostPort, cores),
           name = "Executor")
         workerUrl.foreach {
           url =>

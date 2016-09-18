@@ -40,7 +40,7 @@ import org.apache.spark.partial.BoundedDouble
 import org.apache.spark.partial.CountEvaluator
 import org.apache.spark.partial.GroupedCountEvaluator
 import org.apache.spark.partial.PartialResult
-import org.apache.spark.storage.StorageLevel
+import org.apache.spark.storage.{StorageLevel,BlockId}
 import org.apache.spark.util.{BoundedPriorityQueue, SerializableHyperLogLog, Utils}
 import org.apache.spark.util.collection.OpenHashMap
 import org.apache.spark.util.random.{BernoulliSampler, PoissonSampler}
@@ -99,6 +99,12 @@ abstract class RDD[T: ClassTag](
    * be called once, so it is safe to implement a time-consuming computation in it.
    */
   protected def getPartitions: Array[Partition]
+
+  /**
+   * Get block ID
+   *
+   */
+  def getBlockId(split: Partition): BlockId = null
 
   /**
    * Implemented by subclasses to return how this RDD depends on parent RDDs. This method will only
@@ -207,6 +213,16 @@ abstract class RDD[T: ClassTag](
     }
   }
 
+
+  /**
+   * Return a copy of the RDD partitioned using the specified partitioner.
+   */
+  /*
+  def setPartitioner(partitioner: Partitioner) {
+    self.partitioner = partitioner
+  }
+  */
+
   /**
    * Get the preferred locations of a partition (as hostnames), taking into account whether the
    * RDD is checkpointed.
@@ -224,8 +240,10 @@ abstract class RDD[T: ClassTag](
    */
   final def iterator(split: Partition, context: TaskContext): Iterator[T] = {
     if (storageLevel != StorageLevel.NONE) {
+      //logInfo("Iterator: " + "StorageLevel.exist" + " RDDID " + this.id)
       SparkEnv.get.cacheManager.getOrCompute(this, split, context, storageLevel)
     } else {
+      //logInfo("Iterator: " + "StorageLevel.NONE" + " RDDID " + this.id)
       computeOrReadCheckpoint(split, context)
     }
   }
@@ -329,7 +347,7 @@ abstract class RDD[T: ClassTag](
       : RDD[T] = {
     if (shuffle) {
       /** Distributes elements evenly across output partitions, starting from a random partition. */
-      val distributePartition = (index: Int, items: Iterator[T]) => {
+      def distributePartition(index: Int, items: Iterator[T]): Iterator[(Int, T)] = {
         var position = (new Random(index)).nextInt(numPartitions)
         items.map { t =>
           // Note that the hash code of the key will just be the key itself. The HashPartitioner 
@@ -337,7 +355,7 @@ abstract class RDD[T: ClassTag](
           position = position + 1
           (position, t)
         }
-      } : Iterator[(Int, T)]
+      }
 
       // include a shuffle step so that our upstream tasks are still distributed
       new CoalescedRDD(
@@ -488,10 +506,6 @@ abstract class RDD[T: ClassTag](
   /**
    * Return an RDD of grouped items. Each group consists of a key and a sequence of elements
    * mapping to that key.
-   *
-   * Note: This operation may be very expensive. If you are grouping in order to perform an
-   * aggregation (such as a sum or average) over each key, using [[PairRDDFunctions.aggregateByKey]]
-   * or [[PairRDDFunctions.reduceByKey]] will provide much better performance.
    */
   def groupBy[K](f: T => K)(implicit kt: ClassTag[K]): RDD[(K, Iterable[T])] =
     groupBy[K](f, defaultPartitioner(this))
@@ -499,10 +513,6 @@ abstract class RDD[T: ClassTag](
   /**
    * Return an RDD of grouped elements. Each group consists of a key and a sequence of elements
    * mapping to that key.
-   *
-   * Note: This operation may be very expensive. If you are grouping in order to perform an
-   * aggregation (such as a sum or average) over each key, using [[PairRDDFunctions.aggregateByKey]]
-   * or [[PairRDDFunctions.reduceByKey]] will provide much better performance.
    */
   def groupBy[K](f: T => K, numPartitions: Int)(implicit kt: ClassTag[K]): RDD[(K, Iterable[T])] =
     groupBy(f, new HashPartitioner(numPartitions))
@@ -510,10 +520,6 @@ abstract class RDD[T: ClassTag](
   /**
    * Return an RDD of grouped items. Each group consists of a key and a sequence of elements
    * mapping to that key.
-   *
-   * Note: This operation may be very expensive. If you are grouping in order to perform an
-   * aggregation (such as a sum or average) over each key, using [[PairRDDFunctions.aggregateByKey]]
-   * or [[PairRDDFunctions.reduceByKey]] will provide much better performance.
    */
   def groupBy[K](f: T => K, p: Partitioner)(implicit kt: ClassTag[K], ord: Ordering[K] = null)
       : RDD[(K, Iterable[T])] = {
@@ -712,16 +718,14 @@ abstract class RDD[T: ClassTag](
    * Applies a function f to all elements of this RDD.
    */
   def foreach(f: T => Unit) {
-    val cleanF = sc.clean(f)
-    sc.runJob(this, (iter: Iterator[T]) => iter.foreach(cleanF))
+    sc.runJob(this, (iter: Iterator[T]) => iter.foreach(f))
   }
 
   /**
    * Applies a function f to each partition of this RDD.
    */
   def foreachPartition(f: Iterator[T] => Unit) {
-    val cleanF = sc.clean(f)
-    sc.runJob(this, (iter: Iterator[T]) => cleanF(iter))
+    sc.runJob(this, (iter: Iterator[T]) => f(iter))
   }
 
   /**
@@ -888,19 +892,19 @@ abstract class RDD[T: ClassTag](
       throw new SparkException("countByValue() does not support arrays")
     }
     // TODO: This should perhaps be distributed by default.
-    val countPartition = (iter: Iterator[T]) => {
+    def countPartition(iter: Iterator[T]): Iterator[OpenHashMap[T,Long]] = {
       val map = new OpenHashMap[T,Long]
       iter.foreach {
         t => map.changeValue(t, 1L, _ + 1L)
       }
       Iterator(map)
-    } : Iterator[OpenHashMap[T,Long]]
-    val mergeMaps = (m1: OpenHashMap[T,Long], m2: OpenHashMap[T,Long]) => {
+    }
+    def mergeMaps(m1: OpenHashMap[T,Long], m2: OpenHashMap[T,Long]): OpenHashMap[T,Long] = {
       m2.foreach { case (key, value) =>
         m1.changeValue(key, value, _ + value)
       }
       m1
-    } : OpenHashMap[T,Long]
+    }
     val myResult = mapPartitions(countPartition).reduce(mergeMaps)
     // Convert to a Scala mutable map
     val mutableResult = scala.collection.mutable.Map[T,Long]()
@@ -1021,11 +1025,11 @@ abstract class RDD[T: ClassTag](
    * Returns the top K (largest) elements from this RDD as defined by the specified
    * implicit Ordering[T]. This does the opposite of [[takeOrdered]]. For example:
    * {{{
-   *   sc.parallelize(Seq(10, 4, 2, 12, 3)).top(1)
-   *   // returns Array(12)
+   *   sc.parallelize([10, 4, 2, 12, 3]).top(1)
+   *   // returns [12]
    *
-   *   sc.parallelize(Seq(2, 3, 4, 5, 6)).top(2)
-   *   // returns Array(6, 5)
+   *   sc.parallelize([2, 3, 4, 5, 6]).top(2)
+   *   // returns [6, 5]
    * }}}
    *
    * @param num the number of top elements to return
@@ -1039,11 +1043,11 @@ abstract class RDD[T: ClassTag](
    * implicit Ordering[T] and maintains the ordering. This does the opposite of [[top]].
    * For example:
    * {{{
-   *   sc.parallelize(Seq(10, 4, 2, 12, 3)).takeOrdered(1)
-   *   // returns Array(2)
+   *   sc.parallelize([10, 4, 2, 12, 3]).takeOrdered(1)
+   *   // returns [12]
    *
-   *   sc.parallelize(Seq(2, 3, 4, 5, 6)).takeOrdered(2)
-   *   // returns Array(2, 3)
+   *   sc.parallelize([2, 3, 4, 5, 6]).takeOrdered(2)
+   *   // returns [2, 3]
    * }}}
    *
    * @param num the number of top elements to return
@@ -1149,7 +1153,7 @@ abstract class RDD[T: ClassTag](
 
   /** User code that created this RDD (e.g. `textFile`, `parallelize`). */
   @transient private[spark] val creationSiteInfo = Utils.getCallSiteInfo
-  private[spark] def getCreationSite: String = Option(creationSiteInfo).getOrElse("").toString
+  private[spark] def getCreationSite: String = creationSiteInfo.toString
 
   private[spark] def elementClassTag: ClassTag[T] = classTag[T]
 
