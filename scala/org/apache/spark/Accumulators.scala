@@ -258,7 +258,7 @@ private object Accumulators {
   }
 
   // Clear the local (non-original) accumulators for the current thread
-  def clear() {
+  def  () {
     synchronized {
       localAccums.remove(Thread.currentThread)
     }
